@@ -127,3 +127,8 @@ async def run(req: RunRequest, _: str = Depends(verify_token)):
     results = await asyncio.gather(*tasks)
     
     return {"answers": results}
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("model:app", host="0.0.0.0", port=port)
