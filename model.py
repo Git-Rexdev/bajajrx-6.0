@@ -62,9 +62,18 @@ Question: {question}
     validate_template=True
 )
 
-def full_context(doc):
-    context_text = "\n\n".join(i.page_content for i in doc)
-    return context_text
+def full_context(documents):
+    context_parts = []
+    for doc in documents:
+        category = doc.metadata.get("category", "").lower()
+        content = doc.page_content.strip()
+        if not content:
+            continue
+        if "table" in category:
+            context_parts.append(f"[TABLE]\n{content}\n[/TABLE]")
+        else:
+            context_parts.append(content)
+    return "\n\n".join(context_parts)
 
 API_TOKEN = "f799dd3c9ae79667d28623cf53c3683e115c2ebb26fff88fafc7bc55225c70d1"
 
