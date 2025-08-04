@@ -1,10 +1,11 @@
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_core.prompts import PromptTemplate
 import aiohttp
 from dotenv import load_dotenv
 load_dotenv()
-from langchain_community.document_loaders import UnstructuredWordDocumentLoader, UnstructuredEmailLoader
+from langchain_community.document_loaders import UnstructuredFileLoader
 from urllib.parse import urlparse
 from pydantic import BaseModel
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -12,14 +13,11 @@ from uuid import uuid4
 from langchain.vectorstores import FAISS
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-import os
 from starlette.concurrency import run_in_threadpool
-from langchain_core.runnables import RunnableLambda, RunnableParallel, RunnablePassthrough
 from typing import List
 import tempfile
 import asyncio
 import concurrent.futures
-import pickle
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -49,7 +47,13 @@ model = ChatOpenAI(
 
 template = PromptTemplate(
     template="""
-You are a helpful assistant for conversational question-answering tasks. Use the following pieces of retrieved context to answer the question. If you don't know the answer, just say that you don't know. Give the response in a short conversational manner.
+You are a helpful assistant for answering questions using provided document context.
+
+The context may include tables (between [TABLE]...[/TABLE]). Use them carefully to answer precisely.
+
+If you don't know the answer, just say so.
+Give the response in a short conversational manner.
+
 Context: {context}
 
 Question: {question}
@@ -61,11 +65,6 @@ Question: {question}
 def full_context(doc):
     context_text = "\n\n".join(i.page_content for i in doc)
     return context_text
-
-parallel_chain = RunnableParallel({
-    'question': RunnablePassthrough(),
-    'context': RunnableLambda(full_context)
-})
 
 API_TOKEN = "f799dd3c9ae79667d28623cf53c3683e115c2ebb26fff88fafc7bc55225c70d1"
 
@@ -97,36 +96,34 @@ async def run(req: RunRequest, _: str = Depends(verify_token)):
         tmp.write(pdf_content)
         tmp_path = tmp.name
 
-    if file_ext == ".pdf":
-        loader_cls = PyMuPDFLoader
-    elif file_ext == ".docx":
-        loader_cls = UnstructuredWordDocumentLoader
-    elif file_ext in [".eml", ".msg"]:
-        loader_cls = UnstructuredEmailLoader
-    else:
-        raise HTTPException(status_code=400, detail="Unsupported file type.")
+    # if file_ext == ".pdf":
+    #     loader_cls = PyMuPDFLoader
+    # elif file_ext == ".docx":
+    #     loader_cls = UnstructuredWordDocumentLoader
+    # elif file_ext in [".eml", ".msg"]:
+    #     loader_cls = UnstructuredEmailLoader
+    # else:
+    #     raise HTTPException(status_code=400, detail="Unsupported file type.")
 
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        loader = await run_in_threadpool(loader_cls, tmp_path)
+        loader = await run_in_threadpool(UnstructuredFileLoader, tmp_path, mode="elements")
         docs = await run_in_threadpool(loader.load)
 
         splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
         chunks = await run_in_threadpool(splitter.split_documents, docs)
 
-    session_id = str(uuid4())
+    # session_id = str(uuid4())
 
 
     first_batch = chunks[:100]
     db = await run_in_threadpool(FAISS.from_documents, first_batch, embedding_model)
-    # db = await run_in_threadpool(FAISS.from_documents, [], embedding_model)
     
     BATCH_SIZE = 100 
 
     for i in range(100, len(chunks), BATCH_SIZE):
         batch = chunks[i:i + BATCH_SIZE]
         await run_in_threadpool(db.add_documents, batch)
-        print(f"Embedding batch {i // BATCH_SIZE + 1} of {(len(chunks) + BATCH_SIZE - 1) // BATCH_SIZE}")
     
 
     retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 8})
@@ -141,7 +138,7 @@ async def run(req: RunRequest, _: str = Depends(verify_token)):
     tasks = [process_single_question(q) for q in req.questions]
     results = await asyncio.gather(*tasks)
     
-    return {"session_id": session_id, "answers": results}
+    return {"answers": results}
 
 if __name__ == "__main__":
     import uvicorn
