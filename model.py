@@ -4,29 +4,30 @@ from langchain_core.prompts import PromptTemplate
 import aiohttp
 from dotenv import load_dotenv
 load_dotenv()
+from langchain_community.document_loaders import UnstructuredWordDocumentLoader, UnstructuredEmailLoader
+from urllib.parse import urlparse
 from pydantic import BaseModel
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from uuid import uuid4
-from langchain_pinecone import PineconeVectorStore
-from fastapi import FastAPI, HTTPException,Depends, Header
+from langchain.vectorstores import FAISS
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 import os
-from pinecone import Pinecone, ServerlessSpec
 from starlette.concurrency import run_in_threadpool
-from langchain_core.runnables import RunnableLambda,RunnableParallel,RunnablePassthrough
+from langchain_core.runnables import RunnableLambda, RunnableParallel, RunnablePassthrough
 from typing import List
 import tempfile
 import asyncio
 import concurrent.futures
+import pickle
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 app = FastAPI()
 
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -36,40 +37,34 @@ class Query(BaseModel):
     query: str
     session_id: str
 
-
 embedding_model = OpenAIEmbeddings(model='text-embedding-3-small')
 
-model = ChatOpenAI(model='gpt-4.1-nano-2025-04-14',max_tokens=300,  # Reduced from 400
-    temperature=0.2,  # Reduced from 0.4 for faster processing
-    request_timeout=15,  # Add timeout
-    max_retries=1 )
+model = ChatOpenAI(
+    model='gpt-4.1-nano-2025-04-14',
+    max_tokens=300,
+    temperature=0.2,
+    request_timeout=15,
+    max_retries=1
+)
 
+template = PromptTemplate(
+    template="""
+You are a helpful assistant for conversational question-answering tasks. Use the following pieces of retrieved context to answer the question. If you don't know the answer, just say that you don't know. Give the response in a short conversational manner.
+Context: {context}
 
-pc =Pinecone()
-
-index_name = "bajajhackrx"
-
-if not pc.has_index(index_name):
-    pc.create_index(name=index_name,
-                    dimension=1536,
-                    metric='cosine',
-                    spec=ServerlessSpec(cloud='aws',region='us-east-1'))
-    
-index_store = pc.Index(index_name)
-store = PineconeVectorStore(index=index_store,embedding=embedding_model)
-
-template = PromptTemplate(template="""
-You are helpfull assistant for conversational question-answering tasks. Use the following pieces of retrieved context to answer the question. If you don't know the answer, just say that you don't know. Give response in short conversational manner.
-    Context: {context}\n\n
-    Question : {question}""",input_variables=['context','question'],validate_template=True)
+Question: {question}
+""",
+    input_variables=['context', 'question'],
+    validate_template=True
+)
 
 def full_context(doc):
     context_text = "\n\n".join(i.page_content for i in doc)
     return context_text
 
 parallel_chain = RunnableParallel({
-    'question':RunnablePassthrough(),
-    'context':RunnableLambda(full_context)
+    'question': RunnablePassthrough(),
+    'context': RunnableLambda(full_context)
 })
 
 API_TOKEN = "f799dd3c9ae79667d28623cf53c3683e115c2ebb26fff88fafc7bc55225c70d1"
@@ -92,28 +87,49 @@ async def run(req: RunRequest, _: str = Depends(verify_token)):
             if response.status != 200:
                 raise HTTPException(status_code=400, detail="Unable to fetch document")
             pdf_content = await response.read()
-    
+    parsed_url = urlparse(req.documents)
+    file_ext = os.path.splitext(parsed_url.path)[-1].lower()
+    if file_ext not in [".pdf", ".docx", ".eml", ".msg"]:
+        raise HTTPException(status_code=400, detail="Unsupported file format. Only PDF, DOCX, EML, MSG are supported.")
+
     # Save to temporary file
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(pdf_content)
         tmp_path = tmp.name
-    
-    # Use ThreadPoolExecutor for CPU-bound operations
+
+    if file_ext == ".pdf":
+        loader_cls = PyMuPDFLoader
+    elif file_ext == ".docx":
+        loader_cls = UnstructuredWordDocumentLoader
+    elif file_ext in [".eml", ".msg"]:
+        loader_cls = UnstructuredEmailLoader
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file type.")
+
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        # Load and split documents in parallel
-        loader = await run_in_threadpool(PyMuPDFLoader, tmp_path)
+        loader = await run_in_threadpool(loader_cls, tmp_path)
         docs = await run_in_threadpool(loader.load)
-        
-        splitter = RecursiveCharacterTextSplitter(chunk_size=4500, chunk_overlap=200)
-        
+
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
         chunks = await run_in_threadpool(splitter.split_documents, docs)
 
-    # Create session and store embeddings
     session_id = str(uuid4())
-    await run_in_threadpool(store.add_documents, chunks, namespace=session_id)
 
-    # Create retriever
-    retriever = store.as_retriever(search_type="similarity", search_kwargs={"k": 8, "namespace": session_id})
+
+    first_batch = chunks[:100]
+    db = await run_in_threadpool(FAISS.from_documents, first_batch, embedding_model)
+    # db = await run_in_threadpool(FAISS.from_documents, [], embedding_model)
+    
+    BATCH_SIZE = 100 
+
+    for i in range(100, len(chunks), BATCH_SIZE):
+        batch = chunks[i:i + BATCH_SIZE]
+        await run_in_threadpool(db.add_documents, batch)
+        print(f"Embedding batch {i // BATCH_SIZE + 1} of {(len(chunks) + BATCH_SIZE - 1) // BATCH_SIZE}")
+    
+
+    retriever = db.as_retriever(search_type="similarity", search_kwargs={"k": 8})
 
     async def process_single_question(question: str):
         retrieved_docs = retriever.invoke(question)
@@ -121,12 +137,11 @@ async def run(req: RunRequest, _: str = Depends(verify_token)):
         prompt = template.invoke({'context': context, 'question': question})
         response = model.invoke(prompt)
         return response.content
-    
-    # Process all questions concurrently
+
     tasks = [process_single_question(q) for q in req.questions]
     results = await asyncio.gather(*tasks)
     
-    return {"answers": results}
+    return {"session_id": session_id, "answers": results}
 
 if __name__ == "__main__":
     import uvicorn
