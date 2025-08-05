@@ -18,6 +18,9 @@ from typing import List
 import tempfile
 import asyncio
 import concurrent.futures
+from langchain_community.document_loaders import PyMuPDFLoader, UnstructuredWordDocumentLoader
+import pdfplumber
+from langchain_core.documents import Document
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -75,6 +78,34 @@ def full_context(documents):
             context_parts.append(content)
     return "\n\n".join(context_parts)
 
+def load_with_pdfplumber(file_path):
+    docs = []
+    with pdfplumber.open(file_path) as pdf:
+        for i, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+            tables = page.extract_tables()
+            content = text.strip()
+            if tables:
+                for table in tables:
+                    table_text = "\n".join(["\t".join(row) for row in table if row])
+                    content += f"\n[TABLE]\n{table_text}\n[/TABLE]"
+            docs.append(Document(page_content=content, metadata={"source": f"page_{i}"}))
+    return docs
+
+async def load_file(tmp_path, file_ext):
+    if file_ext == ".pdf":
+        try:
+            loader = await run_in_threadpool(PyMuPDFLoader, tmp_path)
+            docs = await run_in_threadpool(loader.load)
+        except Exception:
+            docs = await run_in_threadpool(load_with_pdfplumber, tmp_path)
+    elif file_ext == ".docx":
+        loader = await run_in_threadpool(UnstructuredWordDocumentLoader, tmp_path)
+        docs = await run_in_threadpool(loader.load)
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported file format.")
+    return docs
+
 API_TOKEN = "f799dd3c9ae79667d28623cf53c3683e115c2ebb26fff88fafc7bc55225c70d1"
 
 def verify_token(authorization: str = Header(...)):
@@ -116,9 +147,9 @@ async def run(req: RunRequest, _: str = Depends(verify_token)):
 
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor:
-        loader = await run_in_threadpool(UnstructuredFileLoader, tmp_path, mode="elements")
-        docs = await run_in_threadpool(loader.load)
-
+        # loader = await run_in_threadpool(UnstructuredFileLoader, tmp_path, mode="elements")
+        # docs = await run_in_threadpool(loader.load)
+        docs = await load_file(tmp_path, file_ext)
         splitter = RecursiveCharacterTextSplitter(chunk_size=1500, chunk_overlap=200)
         chunks = await run_in_threadpool(splitter.split_documents, docs)
 
